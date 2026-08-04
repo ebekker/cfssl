@@ -1,6 +1,6 @@
 module github.com/cloudflare/cfssl
 
-go 1.25.0
+go 1.25
 
 require (
 	bitbucket.org/liamstask/goose v0.0.0-20150115234039-8488cc47d90c
