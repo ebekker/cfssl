@@ -23,6 +23,7 @@ import (
 	cferr "github.com/cloudflare/cfssl/errors"
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/info"
+	"github.com/cloudflare/cfssl/log"
 )
 
 // Subject contains the information that should be used to override the
@@ -186,6 +187,47 @@ func isCommonAttr(t []int) bool {
 	return (len(t) == 4 && t[0] == 2 && t[1] == 5 && t[2] == 4 && (t[3] == 3 || (t[3] >= 5 && t[3] <= 11) || t[3] == 17))
 }
 
+// caMangedExtensionOIDs is the set of X.509v3 extension OIDs whose values are
+// authoritatively determined by the CA's signing profile (via FillTemplate) and
+// must never be copied from a CSR. Allowing a CSR to supply these via
+// ExtraExtensions would silently override the profile because Go's
+// x509.CreateCertificate gives ExtraExtensions precedence over struct fields
+// for the same OID.
+//
+// See: https://pkg.go.dev/crypto/x509#Certificate (ExtraExtensions field).
+var caManagedExtensionOIDs = map[string]bool{
+	// Key Usage (RFC 5280, 4.2.1.3) — set by profile.Usages()
+	asn1.ObjectIdentifier{2, 5, 29, 15}.String(): true,
+	// Extended Key Usage (RFC 5280, 4.2.1.12) — set by profile.Usages()
+	asn1.ObjectIdentifier{2, 5, 29, 37}.String(): true,
+	// Basic Constraints (RFC 5280, 4.2.1.9) — already handled specially above,
+	// but included for defense-in-depth
+	asn1.ObjectIdentifier{2, 5, 29, 19}.String(): true,
+	// Subject Key Identifier (RFC 5280, 4.2.1.2) — computed by FillTemplate
+	asn1.ObjectIdentifier{2, 5, 29, 14}.String(): true,
+	// Authority Key Identifier (RFC 5280, 4.2.1.1) — set by CreateCertificate
+	// from the issuer
+	asn1.ObjectIdentifier{2, 5, 29, 35}.String(): true,
+	// Authority Info Access / OCSP (RFC 5280, 4.2.2.1) — set by profile OCSP URL
+	asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}.String(): true,
+	// CRL Distribution Points (RFC 5280, 4.2.1.13) — set by profile CRL URL
+	asn1.ObjectIdentifier{2, 5, 29, 31}.String(): true,
+	// Certificate Policies (RFC 5280, 4.2.1.4) — set by profile Policies
+	asn1.ObjectIdentifier{2, 5, 29, 32}.String(): true,
+	// Name Constraints (RFC 5280, 4.2.1.10) — CA-controlled
+	asn1.ObjectIdentifier{2, 5, 29, 30}.String(): true,
+	// Subject Alternative Name (RFC 5280, 4.2.1.6) — handled via Hosts/SANs
+	asn1.ObjectIdentifier{2, 5, 29, 17}.String(): true,
+	// Issuer Alternative Name (RFC 5280, 4.2.1.7) — CA-controlled
+	asn1.ObjectIdentifier{2, 5, 29, 18}.String(): true,
+}
+
+// isCAManagedExtension reports whether the given OID is for an extension whose
+// value is authoritatively set by the CA and must not be copied from a CSR.
+func isCaManagedExtension(oid asn1.ObjectIdentifier) bool {
+	return caManagedExtensionOIDs[oid.String()]
+}
+
 // ParseCertificateRequest takes an incoming certificate request and
 // builds a certificate template from it.
 func ParseCertificateRequest(s Signer, p *config.SigningProfile, csrBytes []byte) (template *x509.Certificate, err error) {
@@ -253,8 +295,16 @@ func ParseCertificateRequest(s Signer, p *config.SigningProfile, csrBytes []byte
 		} else if val.Id.Equal(helpers.DelegationUsage) {
 			template.ExtraExtensions = append(template.ExtraExtensions, val)
 		} else {
-			// If the profile has 'copy_extensions' to true then lets add it
+			// If the profile has 'copy_extensions' to true then copy the
+			// extension, but never copy CA-managed extensions (KeyUsage,
+			// ExtKeyUsage, SKI, AKI, etc.) whose values are set by the
+			// signing profile. Allowing them through would let a CSR
+			// override the CA's policy via ExtraExtensions precedence.
 			if p.CopyExtensions {
+				if isCaManagedExtension(val.Id) {
+					log.Warningf("copy_extensions: skipping CA-managed extension OID %s from CSR", val.Id)
+					continue
+				}
 				template.ExtraExtensions = append(template.ExtraExtensions, val)
 			}
 		}

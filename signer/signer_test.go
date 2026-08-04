@@ -107,6 +107,38 @@ func TestAddPoliciesWithQualifiers(t *testing.T) {
 	}
 }
 
+func TestIsCaManagedExtension(t *testing.T) {
+	tests := []struct {
+		name string
+		oid  asn1.ObjectIdentifier
+		want bool
+	}{
+		{"KeyUsage", asn1.ObjectIdentifier{2, 5, 29, 15}, true},
+		{"ExtKeyUsage", asn1.ObjectIdentifier{2, 5, 29, 37}, true},
+		{"BasicConstraints", asn1.ObjectIdentifier{2, 5, 29, 19}, true},
+		{"SubjectKeyIdentifier", asn1.ObjectIdentifier{2, 5, 29, 14}, true},
+		{"AuthorityKeyIdentifier", asn1.ObjectIdentifier{2, 5, 29, 35}, true},
+		{"AuthorityInfoAccess", asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}, true},
+		{"CRLDistributionPoints", asn1.ObjectIdentifier{2, 5, 29, 31}, true},
+		{"CertificatePolicies", asn1.ObjectIdentifier{2, 5, 29, 32}, true},
+		{"NameConstraints", asn1.ObjectIdentifier{2, 5, 29, 30}, true},
+		{"SubjectAltName", asn1.ObjectIdentifier{2, 5, 29, 17}, true},
+		{"IssuerAltName", asn1.ObjectIdentifier{2, 5, 29, 18}, true},
+		{"private use OID", asn1.ObjectIdentifier{1, 2, 3, 4, 5}, false},
+		{"DelegationUsage", asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 44}, false},
+		{"CT Poison", asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isCaManagedExtension(tt.oid)
+			if got != tt.want {
+				t.Errorf("isCaManagedExtension(%v) = %v, want %v", tt.oid, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestName(t *testing.T) {
 	sub := &Subject{
 		CN: "foobar",

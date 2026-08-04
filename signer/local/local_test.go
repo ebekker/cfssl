@@ -1636,3 +1636,307 @@ func TestLint(t *testing.T) {
 		})
 	}
 }
+
+// createCSRWithExtensions generates a CSR containing the given raw X.509v3
+// extensions. This simulates an attacker injecting extensions into a CSR.
+func createCSRWithExtensions(t *testing.T, extraExts []pkix.Extension) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	tmpl := &x509.CertificateRequest{
+		Subject:         pkix.Name{CommonName: "test.example.com"},
+		DNSNames:        []string{"test.example.com"},
+		ExtraExtensions: extraExts,
+	}
+
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
+	if err != nil {
+		t.Fatalf("creating CSR: %v", err)
+	}
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+}
+
+// marshalKeyUsage encodes a KeyUsage bitstring into the DER value expected
+// inside an X.509v3 KeyUsage extension (OID 2.5.29.15).
+func marshalKeyUsage(t *testing.T, ku x509.KeyUsage) []byte {
+	t.Helper()
+	// KeyUsage is a bit string where bits are numbered from the MSB.
+	// Go's x509.KeyUsage constants are already bit positions from MSB.
+	var b [2]byte
+	b[0] = byte(ku >> 8) // not used for standard usages below bit 8
+	// Standard key usages fit in one byte for the common ones:
+	// digitalSignature(0), contentCommitment(1), keyEncipherment(2),
+	// dataEncipherment(3), keyAgreement(4), keyCertSign(5), cRLSign(6),
+	// encipherOnly(7)
+	b[0] = 0
+	b[1] = 0
+	if ku&x509.KeyUsageDigitalSignature != 0 {
+		b[0] |= 0x80
+	}
+	if ku&x509.KeyUsageContentCommitment != 0 {
+		b[0] |= 0x40
+	}
+	if ku&x509.KeyUsageKeyEncipherment != 0 {
+		b[0] |= 0x20
+	}
+	if ku&x509.KeyUsageDataEncipherment != 0 {
+		b[0] |= 0x10
+	}
+	if ku&x509.KeyUsageKeyAgreement != 0 {
+		b[0] |= 0x08
+	}
+	if ku&x509.KeyUsageCertSign != 0 {
+		b[0] |= 0x04
+	}
+	if ku&x509.KeyUsageCRLSign != 0 {
+		b[0] |= 0x02
+	}
+	if ku&x509.KeyUsageEncipherOnly != 0 {
+		b[0] |= 0x01
+	}
+	if ku&x509.KeyUsageDecipherOnly != 0 {
+		b[1] |= 0x80
+	}
+
+	// Determine padding bits: find the lowest set bit
+	var usedBytes int
+	var padBits int
+	if b[1] != 0 {
+		usedBytes = 2
+		for i := 0; i < 8; i++ {
+			if b[1]&(1<<uint(i)) != 0 {
+				padBits = i
+				break
+			}
+		}
+	} else {
+		usedBytes = 1
+		for i := 0; i < 8; i++ {
+			if b[0]&(1<<uint(i)) != 0 {
+				padBits = i
+				break
+			}
+		}
+	}
+
+	bs := asn1.BitString{
+		Bytes:     b[:usedBytes],
+		BitLength: usedBytes*8 - padBits,
+	}
+	val, err := asn1.Marshal(bs)
+	if err != nil {
+		t.Fatalf("marshaling KeyUsage: %v", err)
+	}
+	return val
+}
+
+// marshalExtKeyUsage encodes ExtKeyUsage OIDs into the DER value expected
+// inside an X.509v3 ExtKeyUsage extension (OID 2.5.29.37).
+func marshalExtKeyUsage(t *testing.T, ekus []asn1.ObjectIdentifier) []byte {
+	t.Helper()
+	val, err := asn1.Marshal(ekus)
+	if err != nil {
+		t.Fatalf("marshaling ExtKeyUsage: %v", err)
+	}
+	return val
+}
+
+// TestCopyExtensionsDoesNotOverrideKeyUsage verifies that when
+// copy_extensions is enabled, a CSR containing injected KeyUsage and
+// ExtKeyUsage extensions cannot override the signing profile's intended
+// key usage values. This is a regression test for a vulnerability where
+// Go's x509.CreateCertificate gave ExtraExtensions precedence over
+// struct fields, allowing CSR-provided KU/EKU to bypass profile restrictions.
+func TestCopyExtensionsDoesNotOverrideKeyUsage(t *testing.T) {
+	// Profile allows only: digitalSignature + serverAuth
+	profilePolicy := &config.Signing{
+		Default: &config.SigningProfile{
+			Usage:          []string{"digital signature", "server auth"},
+			Expiry:         1 * time.Hour,
+			ExpiryString:   "1h",
+			CopyExtensions: true,
+		},
+	}
+
+	s, err := NewSignerFromFile(testCaFile, testCaKeyFile, profilePolicy)
+	if err != nil {
+		t.Fatalf("creating signer: %v", err)
+	}
+
+	// Attacker CSR injects keyCertSign + cRLSign and codeSigning + emailProtection
+	attackerKU := x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+	attackerEKUs := []asn1.ObjectIdentifier{
+		{1, 3, 6, 1, 5, 5, 7, 3, 3}, // codeSigning
+		{1, 3, 6, 1, 5, 5, 7, 3, 4}, // emailProtection
+	}
+
+	csrPEM := createCSRWithExtensions(t, []pkix.Extension{
+		{
+			Id:       asn1.ObjectIdentifier{2, 5, 29, 15}, // KeyUsage
+			Critical: true,
+			Value:    marshalKeyUsage(t, attackerKU),
+		},
+		{
+			Id:       asn1.ObjectIdentifier{2, 5, 29, 37}, // ExtKeyUsage
+			Critical: false,
+			Value:    marshalExtKeyUsage(t, attackerEKUs),
+		},
+	})
+
+	certPEM, err := s.Sign(signer.SignRequest{
+		Hosts:   []string{"test.example.com"},
+		Request: string(csrPEM),
+	})
+	if err != nil {
+		t.Fatalf("signing: %v", err)
+	}
+
+	cert, err := helpers.ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("parsing signed cert: %v", err)
+	}
+
+	// The cert MUST have only the profile's KeyUsage (digitalSignature),
+	// NOT the attacker's keyCertSign or cRLSign.
+	if cert.KeyUsage&x509.KeyUsageCertSign != 0 {
+		t.Errorf("certificate has keyCertSign — attacker's KeyUsage was not filtered")
+	}
+	if cert.KeyUsage&x509.KeyUsageCRLSign != 0 {
+		t.Errorf("certificate has cRLSign — attacker's KeyUsage was not filtered")
+	}
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		t.Errorf("certificate missing digitalSignature from profile")
+	}
+
+	// The cert MUST have only the profile's EKU (serverAuth),
+	// NOT the attacker's codeSigning or emailProtection.
+	for _, eku := range cert.ExtKeyUsage {
+		switch eku {
+		case x509.ExtKeyUsageCodeSigning:
+			t.Errorf("certificate has codeSigning EKU — attacker's ExtKeyUsage was not filtered")
+		case x509.ExtKeyUsageEmailProtection:
+			t.Errorf("certificate has emailProtection EKU — attacker's ExtKeyUsage was not filtered")
+		}
+	}
+
+	foundServerAuth := false
+	for _, eku := range cert.ExtKeyUsage {
+		if eku == x509.ExtKeyUsageServerAuth {
+			foundServerAuth = true
+			break
+		}
+	}
+	if !foundServerAuth {
+		t.Errorf("certificate missing serverAuth EKU from profile")
+	}
+}
+
+// TestCopyExtensionsAllowsNonManagedOIDs verifies that CopyExtensions
+// still copies through non-security-critical, non-CA-managed extensions
+// (e.g., private-use OIDs). This ensures the blocklist does not break
+// legitimate use cases for copy_extensions.
+func TestCopyExtensionsAllowsNonManagedOIDs(t *testing.T) {
+	profilePolicy := &config.Signing{
+		Default: &config.SigningProfile{
+			Usage:          []string{"digital signature", "server auth"},
+			Expiry:         1 * time.Hour,
+			ExpiryString:   "1h",
+			CopyExtensions: true,
+		},
+	}
+
+	s, err := NewSignerFromFile(testCaFile, testCaKeyFile, profilePolicy)
+	if err != nil {
+		t.Fatalf("creating signer: %v", err)
+	}
+
+	// A private-use extension that should be copied through
+	customOID := asn1.ObjectIdentifier{1, 2, 3, 4, 5, 6, 7}
+	customValue, _ := asn1.Marshal("custom-extension-value")
+
+	csrPEM := createCSRWithExtensions(t, []pkix.Extension{
+		{
+			Id:    customOID,
+			Value: customValue,
+		},
+	})
+
+	certPEM, err := s.Sign(signer.SignRequest{
+		Hosts:   []string{"test.example.com"},
+		Request: string(csrPEM),
+	})
+	if err != nil {
+		t.Fatalf("signing: %v", err)
+	}
+
+	cert, err := helpers.ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("parsing signed cert: %v", err)
+	}
+
+	found := false
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(customOID) {
+			found = true
+			if !bytes.Equal(ext.Value, customValue) {
+				t.Errorf("custom extension value mismatch: got %x, want %x", ext.Value, customValue)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("custom extension (OID %s) was not copied into the certificate", customOID)
+	}
+}
+
+// TestCopyExtensionsDisabledDoesNotCopy verifies that when copy_extensions
+// is false (the default), CSR extensions are NOT copied — whether they are
+// CA-managed or not.
+func TestCopyExtensionsDisabledDoesNotCopy(t *testing.T) {
+	profilePolicy := &config.Signing{
+		Default: &config.SigningProfile{
+			Usage:          []string{"digital signature", "server auth"},
+			Expiry:         1 * time.Hour,
+			ExpiryString:   "1h",
+			CopyExtensions: false,
+		},
+	}
+
+	s, err := NewSignerFromFile(testCaFile, testCaKeyFile, profilePolicy)
+	if err != nil {
+		t.Fatalf("creating signer: %v", err)
+	}
+
+	customOID := asn1.ObjectIdentifier{1, 2, 3, 4, 5, 6, 7}
+	customValue, _ := asn1.Marshal("should-not-appear")
+
+	csrPEM := createCSRWithExtensions(t, []pkix.Extension{
+		{
+			Id:    customOID,
+			Value: customValue,
+		},
+	})
+
+	certPEM, err := s.Sign(signer.SignRequest{
+		Hosts:   []string{"test.example.com"},
+		Request: string(csrPEM),
+	})
+	if err != nil {
+		t.Fatalf("signing: %v", err)
+	}
+
+	cert, err := helpers.ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("parsing signed cert: %v", err)
+	}
+
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(customOID) {
+			t.Errorf("custom extension (OID %s) should NOT be in cert when CopyExtensions is false", customOID)
+		}
+	}
+}
